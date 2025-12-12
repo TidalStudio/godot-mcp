@@ -4,7 +4,8 @@
       "Bash(npx tsc:*)",
       "Bash(npm install)",
       "Bash(claude mcp list:*)",
-      "Bash(npm run build:*)"
+      "Bash(npm run build:*)",
+      "Bash(node:*)"
     ]
   }
 }

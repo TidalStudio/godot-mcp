@@ -23,6 +23,14 @@ import {
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
 
+import { DAPClient, checkPort } from './dap/dap-client.js';
+import {
+  GetBreakpointsOutput,
+  GetCallStackOutput,
+  GetLocalVariablesOutput,
+} from './dap/dap-types.js';
+import { parseGDScript, getVariableNamesAtLine } from './dap/gdscript-parser.js';
+
 // Check if debug mode is enabled
 const DEBUG_MODE: boolean = process.env.DEBUG === 'true';
 const GODOT_DEBUG_MODE: boolean = true; // Always use GODOT DEBUG MODE
@@ -105,6 +113,12 @@ class GodotServer {
   private validatedPaths: Map<string, boolean> = new Map();
   private strictPathValidation: boolean = false;
 
+  // DAP debugger integration
+  private dapClient: DAPClient | null = null;
+  private bridgeHost: string = '127.0.0.1';
+  private bridgePort: number = 6008;
+  private dapPort: number = 6006;
+
   /**
    * Parameter name mappings between snake_case and camelCase
    * This allows the server to accept both formats
@@ -127,6 +141,12 @@ class GodotServer {
     'scene': 'scene',
     'since_timestamp': 'sinceTimestamp',
     'clear_after_read': 'clearAfterRead',
+    // Debugger tool parameters
+    'stack_frame': 'stackFrame',
+    'thread_id': 'threadId',
+    'max_depth': 'maxDepth',
+    'dap_port': 'dapPort',
+    'bridge_port': 'bridgePort',
   };
 
   /**
@@ -1075,6 +1095,94 @@ class GodotServer {
             required: ['projectPath'],
           },
         },
+        // Debugger integration tools
+        {
+          name: 'connect_debugger',
+          description: 'Connect to Godot editor DAP server for debugging. Requires editor running with MCP Bridge plugin enabled.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              host: {
+                type: 'string',
+                description: 'Host address (default: 127.0.0.1)',
+                default: '127.0.0.1',
+              },
+              dapPort: {
+                type: 'number',
+                description: 'DAP port for debugger (default: 6006)',
+                default: 6006,
+              },
+              bridgePort: {
+                type: 'number',
+                description: 'MCP Bridge plugin port (default: 6008)',
+                default: 6008,
+              },
+            },
+            required: [],
+          },
+        },
+        {
+          name: 'run_project_debug',
+          description: 'Run project in debug mode via the Godot editor. Requires editor open with MCP Bridge plugin.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to project (for verification)',
+              },
+              scene: {
+                type: 'string',
+                description: 'Optional: specific scene to run (res:// path)',
+              },
+            },
+            required: [],
+          },
+        },
+        {
+          name: 'get_breakpoints',
+          description: 'Get all breakpoints in the debugging session',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+            required: [],
+          },
+        },
+        {
+          name: 'get_call_stack',
+          description: 'Get call stack when paused at breakpoint',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              threadId: {
+                type: 'number',
+                description: 'Thread ID to get stack for (default: 1)',
+                default: 1,
+              },
+            },
+            required: [],
+          },
+        },
+        {
+          name: 'get_local_variables',
+          description: 'Get local variables at stack frame',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              stackFrame: {
+                type: 'number',
+                description: 'Stack frame index (0 = current frame, default: 0)',
+                default: 0,
+              },
+              maxDepth: {
+                type: 'number',
+                description: 'Maximum depth for nested object expansion (default: 2)',
+                default: 2,
+              },
+            },
+            required: [],
+          },
+        },
       ],
     }));
 
@@ -1112,6 +1220,17 @@ class GodotServer {
           return await this.handleGetUid(request.params.arguments);
         case 'update_project_uids':
           return await this.handleUpdateProjectUids(request.params.arguments);
+        // Debugger integration tools
+        case 'connect_debugger':
+          return await this.handleConnectDebugger(request.params.arguments);
+        case 'run_project_debug':
+          return await this.handleRunProjectDebug(request.params.arguments);
+        case 'get_breakpoints':
+          return await this.handleGetBreakpoints();
+        case 'get_call_stack':
+          return await this.handleGetCallStack(request.params.arguments);
+        case 'get_local_variables':
+          return await this.handleGetLocalVariables(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -2383,6 +2502,504 @@ class GodotServer {
           'Verify the project path is accessible',
         ]
       );
+    }
+  }
+
+  // ============================================================================
+  // Debugger Integration Handlers
+  // ============================================================================
+
+  /**
+   * Send a command to the MCP Bridge plugin via TCP
+   * @param command The command to send
+   * @returns The response from the plugin
+   */
+  private async sendBridgeCommand(command: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const net = require('net');
+      const socket = new net.Socket();
+      let response = '';
+
+      socket.setTimeout(5000);
+
+      socket.on('connect', () => {
+        socket.write(command);
+      });
+
+      socket.on('data', (data: Buffer) => {
+        response += data.toString();
+        socket.destroy();
+      });
+
+      socket.on('close', () => {
+        resolve(response || 'NO_RESPONSE');
+      });
+
+      socket.on('error', (err: Error) => {
+        reject(err);
+      });
+
+      socket.on('timeout', () => {
+        socket.destroy();
+        reject(new Error('Bridge command timeout'));
+      });
+
+      socket.connect(this.bridgePort, this.bridgeHost);
+    });
+  }
+
+  /**
+   * Handle the connect_debugger tool
+   * Connects to both the MCP Bridge plugin and the DAP server
+   */
+  private async handleConnectDebugger(args: any) {
+    args = this.normalizeParameters(args);
+    const host = args.host || '127.0.0.1';
+    const dapPort = args.dapPort || 6006;
+    const bridgePort = args.bridgePort || 6008;
+
+    this.logDebug(`Connecting to debugger at ${host}:${dapPort} and bridge at ${host}:${bridgePort}`);
+
+    try {
+      // 1. Check if MCP Bridge plugin is reachable
+      const bridgeReachable = await checkPort(host, bridgePort);
+      if (!bridgeReachable) {
+        return this.createErrorResponse(
+          'MCP Bridge plugin not detected',
+          [
+            'Open Godot editor with your project',
+            'Enable the MCP Bridge plugin in Project > Project Settings > Plugins',
+            `Ensure port ${bridgePort} is not blocked`,
+            'Copy the plugin from godot-mcp/src/editor-plugin/ to your project\'s addons/mcp_bridge/ folder',
+          ]
+        );
+      }
+
+      // Ping the bridge to verify it's responding
+      try {
+        const pingResponse = await this.sendBridgeCommand('ping');
+        if (!pingResponse.includes('PONG')) {
+          return this.createErrorResponse(
+            'MCP Bridge plugin not responding correctly',
+            [
+              'Check the Godot editor output for errors',
+              'Try disabling and re-enabling the plugin',
+            ]
+          );
+        }
+      } catch (err) {
+        return this.createErrorResponse(
+          `MCP Bridge plugin communication error: ${(err as Error).message}`,
+          [
+            'Check if the Godot editor is still running',
+            'Try restarting the Godot editor',
+          ]
+        );
+      }
+
+      // 2. Check if DAP is reachable
+      const dapReachable = await checkPort(host, dapPort);
+      if (!dapReachable) {
+        return this.createErrorResponse(
+          'DAP server not detected',
+          [
+            'Enable Debug > Keep Debug Server Open in the editor',
+            'Check Editor > Editor Settings > Network > Debug Adapter',
+            `Ensure DAP port ${dapPort} is not blocked`,
+          ]
+        );
+      }
+
+      // 3. Connect DAP client
+      if (this.dapClient) {
+        this.dapClient.disconnect();
+      }
+
+      this.dapClient = new DAPClient();
+      await this.dapClient.connect(host, dapPort);
+      await this.dapClient.initialize();
+
+      // 4. Store bridge connection info
+      this.bridgeHost = host;
+      this.bridgePort = bridgePort;
+      this.dapPort = dapPort;
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Connected to Godot debugger successfully.\n\n` +
+                  `DAP Server: ${host}:${dapPort}\n` +
+                  `MCP Bridge: ${host}:${bridgePort}\n\n` +
+                  `You can now use run_project_debug, get_breakpoints, get_call_stack, and get_local_variables.`,
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to connect to debugger: ${error?.message || 'Unknown error'}`,
+        [
+          'Ensure Godot editor is running with your project open',
+          'Enable the MCP Bridge plugin',
+          'Enable Debug > Keep Debug Server Open',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the run_project_debug tool
+   * Runs the project via the Godot editor using the MCP Bridge plugin
+   */
+  private async handleRunProjectDebug(args: any) {
+    args = this.normalizeParameters(args);
+
+    // Check if we have a bridge connection
+    if (!this.bridgePort) {
+      return this.createErrorResponse(
+        'Not connected to editor',
+        ['Use connect_debugger first to establish connection']
+      );
+    }
+
+    try {
+      // Verify bridge is still reachable
+      const bridgeReachable = await checkPort(this.bridgeHost, this.bridgePort);
+      if (!bridgeReachable) {
+        return this.createErrorResponse(
+          'Lost connection to MCP Bridge plugin',
+          [
+            'Ensure Godot editor is still running',
+            'Use connect_debugger to reconnect',
+          ]
+        );
+      }
+
+      // Send command to MCP Bridge plugin
+      const command = args.scene
+        ? `play_scene:${args.scene}`
+        : 'play_main';
+
+      const response = await this.sendBridgeCommand(command);
+
+      if (response.startsWith('ERROR:')) {
+        return this.createErrorResponse(
+          `Bridge error: ${response}`,
+          [
+            'Check the Godot editor for more details',
+            'Ensure a main scene is set in project settings',
+          ]
+        );
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Project started in debug mode.\n\nResponse: ${response}\n\n` +
+                  `Set breakpoints in the Godot editor, then use get_call_stack and get_local_variables when paused.`,
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to run project: ${error?.message || 'Unknown error'}`,
+        [
+          'Ensure Godot editor is still running',
+          'Use connect_debugger to reconnect',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the get_breakpoints tool
+   * Returns all breakpoints tracked by the DAP client
+   */
+  private async handleGetBreakpoints() {
+    if (!this.dapClient || !this.dapClient.isConnected()) {
+      return this.createErrorResponse(
+        'Not connected to debugger',
+        ['Use connect_debugger first to establish connection']
+      );
+    }
+
+    try {
+      const breakpoints = this.dapClient.getBreakpoints();
+
+      const output: GetBreakpointsOutput = {
+        breakpoints: breakpoints,
+      };
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(output, null, 2),
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to get breakpoints: ${error?.message || 'Unknown error'}`,
+        [
+          'Ensure debugger is still connected',
+          'Use connect_debugger to reconnect',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the get_call_stack tool
+   * Returns the call stack when paused at a breakpoint
+   */
+  private async handleGetCallStack(args: any) {
+    args = this.normalizeParameters(args);
+
+    if (!this.dapClient || !this.dapClient.isConnected()) {
+      return this.createErrorResponse(
+        'Not connected to debugger',
+        ['Use connect_debugger first to establish connection']
+      );
+    }
+
+    try {
+      const threadId = args.threadId || this.dapClient.getCurrentThreadId();
+      const isPaused = this.dapClient.isPaused();
+
+      if (!isPaused) {
+        const output: GetCallStackOutput = {
+          paused: false,
+          stack: [],
+        };
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(output, null, 2),
+            },
+          ],
+        };
+      }
+
+      // Get stack trace from DAP
+      const stackFrames = await this.dapClient.stackTrace(threadId);
+
+      const output: GetCallStackOutput = {
+        paused: true,
+        stack: stackFrames.map(frame => ({
+          function: frame.name,
+          script: frame.source?.path || frame.source?.name || 'unknown',
+          line: frame.line,
+        })),
+      };
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(output, null, 2),
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to get call stack: ${error?.message || 'Unknown error'}`,
+        [
+          'Ensure debugger is still connected',
+          'Ensure the project is paused at a breakpoint',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the get_local_variables tool
+   * Returns local variables at a specific stack frame
+   *
+   * Since Godot's DAP doesn't properly return scopes, we use script parsing
+   * to discover variable names and then evaluate them individually.
+   */
+  private async handleGetLocalVariables(args: any) {
+    args = this.normalizeParameters(args);
+
+    if (!this.dapClient || !this.dapClient.isConnected()) {
+      return this.createErrorResponse(
+        'Not connected to debugger',
+        ['Use connect_debugger first to establish connection']
+      );
+    }
+
+    try {
+      const stackFrame = args.stackFrame || 0;
+      const threadId = this.dapClient.getCurrentThreadId();
+
+      // Get stack trace to get frame info (script path and line)
+      const stackFrames = await this.dapClient.stackTrace(threadId);
+
+      if (stackFrames.length === 0) {
+        // Not paused - return empty but indicate status
+        const output: GetLocalVariablesOutput = {
+          variables: [],
+        };
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                ...output,
+                note: 'Not paused at breakpoint. Set a breakpoint and trigger it to inspect variables.',
+              }, null, 2),
+            },
+          ],
+        };
+      }
+
+      if (stackFrame >= stackFrames.length) {
+        return this.createErrorResponse(
+          `Stack frame ${stackFrame} does not exist`,
+          [`Valid stack frames: 0 to ${stackFrames.length - 1}`]
+        );
+      }
+
+      const frame = stackFrames[stackFrame];
+      const frameId = frame.id;
+      const scriptPath = frame.source?.path || '';
+      const line = frame.line;
+
+      // Parse the script to discover variable names
+      let variableNames: string[] = ['self']; // Always include self
+      if (scriptPath && existsSync(scriptPath)) {
+        try {
+          const scriptInfo = parseGDScript(scriptPath);
+          variableNames = getVariableNamesAtLine(scriptInfo, line);
+          this.logDebug(`Discovered variables at ${scriptPath}:${line}: ${variableNames.join(', ')}`);
+        } catch (parseErr) {
+          this.logDebug(`Failed to parse script ${scriptPath}: ${parseErr}`);
+        }
+      }
+
+      // Also add common implicit variables
+      if (frame.name && frame.name !== '_ready' && frame.name !== '_init') {
+        // For _process, _physics_process, etc., add 'delta'
+        if (frame.name.includes('process')) {
+          if (!variableNames.includes('delta')) {
+            variableNames.push('delta');
+          }
+        }
+      }
+
+      // Evaluate each variable using DAP
+      const allVariables: Array<{ name: string; type: string; value: string }> = [];
+
+      for (const varName of variableNames) {
+        try {
+          const result = await this.dapClient.evaluate(varName, frameId);
+          if (result) {
+            // Try to infer type from the value
+            let inferredType = 'Variant';
+            const val = result.result;
+
+            if (val.startsWith('(') && val.includes(',')) {
+              // Vector2, Vector3, etc.
+              const commaCount = (val.match(/,/g) || []).length;
+              if (commaCount === 1) inferredType = 'Vector2';
+              else if (commaCount === 2) inferredType = 'Vector3';
+              else if (commaCount === 3) inferredType = 'Vector4/Color';
+            } else if (val === 'true' || val === 'false') {
+              inferredType = 'bool';
+            } else if (val.match(/^-?\d+$/)) {
+              inferredType = 'int';
+            } else if (val.match(/^-?\d+\.\d+$/)) {
+              inferredType = 'float';
+            } else if (val.startsWith('"') || val.startsWith("'")) {
+              inferredType = 'String';
+            } else if (val.startsWith('[')) {
+              inferredType = 'Array';
+            } else if (val.startsWith('{')) {
+              inferredType = 'Dictionary';
+            } else if (val.includes('<') && val.includes('>')) {
+              // Object reference like <EncodedObjectAsID#...>
+              inferredType = 'Object';
+            } else if (val === 'null' || val === '<null>') {
+              inferredType = 'null';
+            }
+
+            allVariables.push({
+              name: varName,
+              type: inferredType,
+              value: val,
+            });
+          }
+        } catch (evalErr) {
+          // Variable might not exist in current scope, skip silently
+          this.logDebug(`Failed to evaluate '${varName}': ${evalErr}`);
+        }
+      }
+
+      const output: GetLocalVariablesOutput = {
+        variables: allVariables,
+      };
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(output, null, 2),
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to get local variables: ${error?.message || 'Unknown error'}`,
+        [
+          'Ensure debugger is still connected',
+          'Ensure the project is paused at a breakpoint',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Expand a variable's value, recursively expanding objects up to maxDepth
+   */
+  private async expandVariableValue(
+    variable: { name: string; value: string; variablesReference: number },
+    maxDepth: number,
+    currentDepth: number
+  ): Promise<string> {
+    // If variable has no children or we've reached max depth, return the value as-is
+    if (variable.variablesReference === 0 || currentDepth >= maxDepth) {
+      if (variable.variablesReference !== 0 && currentDepth >= maxDepth) {
+        return `${variable.value} [depth limit]`;
+      }
+      return variable.value;
+    }
+
+    // Variable has children, expand them
+    try {
+      const children = await this.dapClient!.variables(variable.variablesReference);
+
+      if (children.length === 0) {
+        return variable.value;
+      }
+
+      // Build a representation of the object
+      const childValues: string[] = [];
+      for (const child of children.slice(0, 10)) { // Limit to 10 children
+        const childValue = await this.expandVariableValue(child, maxDepth, currentDepth + 1);
+        childValues.push(`${child.name}: ${childValue}`);
+      }
+
+      if (children.length > 10) {
+        childValues.push(`... and ${children.length - 10} more`);
+      }
+
+      return `{ ${childValues.join(', ')} }`;
+    } catch (err) {
+      return variable.value;
     }
   }
 

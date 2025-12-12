@@ -79,6 +79,11 @@ This direct feedback loop helps AI assistants like Claude understand what works 
 - **UID Management** (for Godot 4.4+):
   - Get UID for specific files
   - Update UID references by resaving resources
+- **Debugger Integration**:
+  - Connect to Godot's DAP (Debug Adapter Protocol) server
+  - Run projects in debug mode via the editor
+  - Inspect local variables when paused at breakpoints
+  - View call stack information
 
 ## Requirements
 
@@ -129,7 +134,12 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "export_mesh_library",
         "save_scene",
         "get_uid",
-        "update_project_uids"
+        "update_project_uids",
+        "connect_debugger",
+        "run_project_debug",
+        "get_breakpoints",
+        "get_call_stack",
+        "get_local_variables"
       ]
     }
   }
@@ -202,6 +212,12 @@ Once configured, your AI assistant will automatically run the MCP server when ne
 "Get the UID for a specific script file in my Godot 4.4 project"
 
 "Update UID references in my Godot project after upgrading to 4.4"
+
+"Connect to the debugger and run my project in debug mode"
+
+"Show me the local variables at the current breakpoint"
+
+"What's in the call stack right now?"
 ```
 
 ## Implementation Details
@@ -223,6 +239,53 @@ This architecture provides several benefits:
 
 The bundled script accepts operation type and parameters as JSON, allowing for flexible and dynamic operation execution without generating temporary files for each operation.
 
+## Debugger Integration Setup
+
+To use the debugger features (`connect_debugger`, `run_project_debug`, `get_call_stack`, `get_local_variables`), you need to install the MCP Bridge plugin in your Godot project:
+
+### Step 1: Copy the Plugin
+
+Copy the `mcp_bridge` folder from this repository to your Godot project's `addons` folder:
+
+```
+your-godot-project/
+├── addons/
+│   └── mcp_bridge/
+│       ├── mcp_bridge.gd
+│       └── plugin.cfg
+├── project.godot
+└── ...
+```
+
+You can find the plugin files at: `godot-mcp/src/editor-plugin/`
+
+### Step 2: Enable the Plugin
+
+1. Open your project in the Godot editor
+2. Go to **Project > Project Settings > Plugins**
+3. Find "MCP Bridge" in the list and check **Enable**
+
+You should see in the Output panel:
+```
+[MCP Bridge] Listening on port 6008
+```
+
+### Step 3: Enable DAP Server
+
+1. In the Godot editor, go to **Debug > Keep Debug Server Open** and enable it
+2. This allows the MCP server to connect to Godot's Debug Adapter Protocol (DAP) on port 6006
+
+### Using the Debugger
+
+Once set up, you can:
+
+1. Use `connect_debugger` to establish a connection to the editor
+2. Use `run_project_debug` to launch your project via the editor (supports breakpoints)
+3. Set breakpoints in the Godot editor by clicking the gutter next to line numbers
+4. When paused at a breakpoint, use `get_call_stack` and `get_local_variables` to inspect state
+
+**Note**: The debugger tools require the Godot editor to be running with your project open.
+
 ## Troubleshooting
 
 - **Godot Not Found**: Set the GODOT_PATH environment variable to your Godot executable
@@ -230,9 +293,14 @@ The bundled script accepts operation type and parameters as JSON, allowing for f
 - **Invalid Project Path**: Ensure the path points to a directory containing a project.godot file
 - **Build Issues**: Make sure all dependencies are installed by running `npm install`
 - **For Cursor Specifically**:
--   Ensure the MCP server shows up and is enabled in Cursor settings (Settings > MCP)
--   MCP tools can only be run using the Agent chat profile (Cursor Pro or Business subscription)
--   Use "Yolo Mode" to automatically run MCP tool requests
+  - Ensure the MCP server shows up and is enabled in Cursor settings (Settings > MCP)
+  - MCP tools can only be run using the Agent chat profile (Cursor Pro or Business subscription)
+  - Use "Yolo Mode" to automatically run MCP tool requests
+- **Debugger Issues**:
+  - "MCP Bridge plugin not detected": Ensure the plugin is installed in your project's `addons/mcp_bridge/` folder and enabled in Project Settings > Plugins
+  - "DAP server not detected": Enable **Debug > Keep Debug Server Open** in the Godot editor
+  - "Not paused at breakpoint": Set a breakpoint in the editor by clicking the gutter, then trigger the code path
+  - Variables not showing: The debugger can only inspect variables when the game is paused at a breakpoint
 
 ## License
 
