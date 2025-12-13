@@ -124,6 +124,10 @@ func _handle_request(connection: StreamPeerTCP, request: String) -> void:
 	elif request == "ping":
 		response = "PONG"
 
+	elif request.begins_with("get_signals:"):
+		var node_path := request.substr(12).strip_edges()
+		response = _get_node_signals(node_path)
+
 	else:
 		response = "ERROR:UNKNOWN_COMMAND:" + request
 
@@ -131,3 +135,90 @@ func _handle_request(connection: StreamPeerTCP, request: String) -> void:
 	var err := connection.put_data(response.to_utf8_buffer())
 	if err != OK:
 		push_error("[MCP Bridge] Failed to send response: ", error_string(err))
+
+
+func _get_node_signals(node_path: String) -> String:
+	var scene_root := EditorInterface.get_edited_scene_root()
+	if not scene_root:
+		return "ERROR:NO_SCENE_OPEN"
+
+	var target_node: Node
+	if node_path.is_empty() or node_path == ".":
+		target_node = scene_root
+	else:
+		# Handle paths like "Player" or "Player/Sprite2D"
+		target_node = scene_root.get_node_or_null(node_path)
+
+	if not target_node:
+		return "ERROR:NODE_NOT_FOUND:" + node_path
+
+	var signals_data := {"signals": [], "node_class": target_node.get_class()}
+	var signal_list := target_node.get_signal_list()
+
+	for sig in signal_list:
+		var signal_info := {
+			"name": sig.name,
+			"parameters": [],
+			"source": _get_signal_source(target_node, sig.name)
+		}
+
+		for arg in sig.args:
+			signal_info.parameters.append({
+				"name": arg.name,
+				"type": _type_to_string(arg.type)
+			})
+
+		signals_data.signals.append(signal_info)
+
+	return "SIGNALS:" + JSON.stringify(signals_data)
+
+
+func _get_signal_source(node: Node, signal_name: String) -> String:
+	# Check if signal is defined in the node's script (custom) or inherited (builtin)
+	var script := node.get_script() as Script
+	if script:
+		# Check if the script defines this signal
+		for sig in script.get_script_signal_list():
+			if sig.name == signal_name:
+				return "custom"
+	return "builtin"
+
+
+func _type_to_string(type_id: int) -> String:
+	match type_id:
+		TYPE_NIL: return "null"
+		TYPE_BOOL: return "bool"
+		TYPE_INT: return "int"
+		TYPE_FLOAT: return "float"
+		TYPE_STRING: return "String"
+		TYPE_VECTOR2: return "Vector2"
+		TYPE_VECTOR2I: return "Vector2i"
+		TYPE_VECTOR3: return "Vector3"
+		TYPE_VECTOR3I: return "Vector3i"
+		TYPE_VECTOR4: return "Vector4"
+		TYPE_VECTOR4I: return "Vector4i"
+		TYPE_RECT2: return "Rect2"
+		TYPE_TRANSFORM2D: return "Transform2D"
+		TYPE_TRANSFORM3D: return "Transform3D"
+		TYPE_PLANE: return "Plane"
+		TYPE_QUATERNION: return "Quaternion"
+		TYPE_AABB: return "AABB"
+		TYPE_BASIS: return "Basis"
+		TYPE_COLOR: return "Color"
+		TYPE_NODE_PATH: return "NodePath"
+		TYPE_RID: return "RID"
+		TYPE_OBJECT: return "Object"
+		TYPE_CALLABLE: return "Callable"
+		TYPE_SIGNAL: return "Signal"
+		TYPE_DICTIONARY: return "Dictionary"
+		TYPE_ARRAY: return "Array"
+		TYPE_PACKED_BYTE_ARRAY: return "PackedByteArray"
+		TYPE_PACKED_INT32_ARRAY: return "PackedInt32Array"
+		TYPE_PACKED_INT64_ARRAY: return "PackedInt64Array"
+		TYPE_PACKED_FLOAT32_ARRAY: return "PackedFloat32Array"
+		TYPE_PACKED_FLOAT64_ARRAY: return "PackedFloat64Array"
+		TYPE_PACKED_STRING_ARRAY: return "PackedStringArray"
+		TYPE_PACKED_VECTOR2_ARRAY: return "PackedVector2Array"
+		TYPE_PACKED_VECTOR3_ARRAY: return "PackedVector3Array"
+		TYPE_PACKED_COLOR_ARRAY: return "PackedColorArray"
+		_: return "Variant"

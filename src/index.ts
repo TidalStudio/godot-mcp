@@ -13,6 +13,7 @@ import { existsSync, readdirSync, mkdirSync } from 'fs';
 import { spawn } from 'child_process';
 import { promisify } from 'util';
 import { exec } from 'child_process';
+import * as net from 'net';
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -1183,6 +1184,26 @@ class GodotServer {
             required: [],
           },
         },
+        {
+          name: 'get_signals',
+          description: 'Get all signals defined on a node in the currently edited scene. Requires Godot editor with MCP Bridge plugin enabled.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              nodePath: {
+                type: 'string',
+                description: 'Path to node relative to scene root (e.g., "Player", "Player/Sprite2D"). Empty or "." for root node.',
+                default: '.',
+              },
+              includeBuiltin: {
+                type: 'boolean',
+                description: 'Include inherited/built-in signals (default: true)',
+                default: true,
+              },
+            },
+            required: [],
+          },
+        },
       ],
     }));
 
@@ -1231,6 +1252,8 @@ class GodotServer {
           return await this.handleGetCallStack(request.params.arguments);
         case 'get_local_variables':
           return await this.handleGetLocalVariables(request.params.arguments);
+        case 'get_signals':
+          return await this.handleGetSignals(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -2516,7 +2539,6 @@ class GodotServer {
    */
   private async sendBridgeCommand(command: string): Promise<string> {
     return new Promise((resolve, reject) => {
-      const net = require('net');
       const socket = new net.Socket();
       let response = '';
 
@@ -2957,6 +2979,95 @@ class GodotServer {
         [
           'Ensure debugger is still connected',
           'Ensure the project is paused at a breakpoint',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the get_signals tool
+   * Gets all signals defined on a node in the edited scene via MCP Bridge
+   */
+  private async handleGetSignals(args: any) {
+    args = this.normalizeParameters(args);
+
+    // Check if we have a bridge connection
+    if (!this.bridgePort) {
+      return this.createErrorResponse(
+        'Not connected to editor',
+        [
+          'Use connect_debugger first to establish connection to the Godot editor',
+          'Ensure the MCP Bridge plugin is enabled in the editor',
+        ]
+      );
+    }
+
+    try {
+      // Verify bridge is still reachable
+      const bridgeReachable = await checkPort(this.bridgeHost, this.bridgePort);
+      if (!bridgeReachable) {
+        return this.createErrorResponse(
+          'Lost connection to MCP Bridge plugin',
+          [
+            'Check if the Godot editor is still running',
+            'Use connect_debugger to reconnect',
+          ]
+        );
+      }
+
+      const nodePath = args.nodePath || '.';
+      const includeBuiltin = args.includeBuiltin ?? true;
+
+      const response = await this.sendBridgeCommand(`get_signals:${nodePath}`);
+
+      if (response.startsWith('ERROR:NO_SCENE_OPEN')) {
+        return this.createErrorResponse(
+          'No scene is currently open in the editor',
+          ['Open a scene in the Godot editor first']
+        );
+      }
+
+      if (response.startsWith('ERROR:NODE_NOT_FOUND:')) {
+        const path = response.split(':')[2];
+        return this.createErrorResponse(
+          `Node not found: ${path}`,
+          [
+            'Check that the node path is correct',
+            'Node path should be relative to the scene root',
+            'Use "." or empty string for the root node',
+          ]
+        );
+      }
+
+      if (response.startsWith('SIGNALS:')) {
+        const jsonStr = response.substring(8);
+        const signalsData = JSON.parse(jsonStr);
+
+        // Filter out builtin signals if requested
+        if (!includeBuiltin) {
+          signalsData.signals = signalsData.signals.filter(
+            (sig: any) => sig.source === 'custom'
+          );
+        }
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(signalsData, null, 2),
+          }],
+        };
+      }
+
+      return this.createErrorResponse(
+        `Unexpected response from bridge: ${response}`,
+        ['Check the Godot editor for errors']
+      );
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to get signals: ${error?.message || 'Unknown error'}`,
+        [
+          'Ensure Godot editor is still running',
+          'Use connect_debugger to reconnect',
         ]
       );
     }
