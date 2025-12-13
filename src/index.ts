@@ -9,7 +9,7 @@
 
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize } from 'path';
-import { existsSync, readdirSync, mkdirSync, readFileSync } from 'fs';
+import { existsSync, readdirSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, copyFileSync } from 'fs';
 import { spawn } from 'child_process';
 import { promisify } from 'util';
 import { exec } from 'child_process';
@@ -101,6 +101,15 @@ interface DebugMessage {
 const MAX_DEBUG_MESSAGES = 500;
 
 /**
+ * Interface for tracking injected autoload state
+ */
+interface InjectedAutoload {
+  scriptPath: string;           // Path to copied script in project
+  projectGodotPath: string;     // Path to project.godot
+  projectGodotBackup: string;   // Backup of original project.godot content
+}
+
+/**
  * Interface for server configuration
  */
 interface GodotServerConfig {
@@ -133,6 +142,9 @@ class GodotServer {
   private bridgeHost: string = '127.0.0.1';
   private bridgePort: number = 6008;
   private dapPort: number = 6006;
+
+  // Screenshot autoload injection state
+  private injectedAutoload: InjectedAutoload | null = null;
 
   /**
    * Parameter name mappings between snake_case and camelCase
@@ -286,6 +298,127 @@ class GodotServer {
 
     // Add more validation as needed
     return true;
+  }
+
+  /**
+   * Inject the screenshot capture AutoLoad into a project
+   * @param projectPath Path to the Godot project
+   */
+  private injectScreenshotAutoload(projectPath: string): void {
+    try {
+      // Source script path (bundled with the MCP server)
+      const sourceScript = join(__dirname, 'scripts', 'screenshot_capture.gd');
+
+      // Destination in the project (use underscore prefix to indicate MCP-managed)
+      const destScript = join(projectPath, '_mcp_screenshot_capture.gd');
+
+      // Copy the script to the project
+      copyFileSync(sourceScript, destScript);
+      this.logDebug(`Copied screenshot capture script to ${destScript}`);
+
+      // Read and modify project.godot
+      const projectGodotPath = join(projectPath, 'project.godot');
+      const originalContent = readFileSync(projectGodotPath, 'utf-8');
+
+      // Check if autoload section exists
+      let modifiedContent: string;
+      const autoloadEntry = 'MCPScreenshot="*res://_mcp_screenshot_capture.gd"';
+
+      if (originalContent.includes('[autoload]')) {
+        // Add our autoload entry after the [autoload] section header
+        modifiedContent = originalContent.replace(
+          /\[autoload\]\s*\n/,
+          `[autoload]\n\n${autoloadEntry}\n`
+        );
+      } else {
+        // No autoload section exists, add one at the end
+        modifiedContent = originalContent + `\n[autoload]\n\n${autoloadEntry}\n`;
+      }
+
+      // Write the modified project.godot
+      writeFileSync(projectGodotPath, modifiedContent);
+      this.logDebug('Injected screenshot AutoLoad into project.godot');
+
+      // Store injection state for cleanup
+      this.injectedAutoload = {
+        scriptPath: destScript,
+        projectGodotPath,
+        projectGodotBackup: originalContent,
+      };
+    } catch (error) {
+      this.logDebug(`Failed to inject screenshot autoload: ${error}`);
+      // Don't throw - screenshot capture just won't work, but project can still run
+    }
+  }
+
+  /**
+   * Remove the injected screenshot capture AutoLoad from a project
+   */
+  private removeScreenshotAutoload(): void {
+    if (!this.injectedAutoload) {
+      return;
+    }
+
+    try {
+      // Restore original project.godot
+      writeFileSync(
+        this.injectedAutoload.projectGodotPath,
+        this.injectedAutoload.projectGodotBackup
+      );
+      this.logDebug('Restored original project.godot');
+
+      // Delete the injected script
+      if (existsSync(this.injectedAutoload.scriptPath)) {
+        unlinkSync(this.injectedAutoload.scriptPath);
+        this.logDebug(`Deleted injected script: ${this.injectedAutoload.scriptPath}`);
+      }
+    } catch (error) {
+      this.logDebug(`Failed to clean up screenshot autoload: ${error}`);
+    } finally {
+      this.injectedAutoload = null;
+    }
+  }
+
+  /**
+   * Get the Godot user:// data path for a project
+   * @param projectPath Path to the Godot project
+   * @returns The platform-specific user data path
+   */
+  private getUserDataPath(projectPath: string): string {
+    // Read project name from project.godot
+    const projectFile = join(projectPath, 'project.godot');
+    let projectName = basename(projectPath);
+
+    if (existsSync(projectFile)) {
+      const content = readFileSync(projectFile, 'utf-8');
+      const nameMatch = content.match(/config\/name="([^"]+)"/);
+      if (nameMatch) {
+        projectName = nameMatch[1];
+      }
+    }
+
+    // Platform-specific user data path
+    const platform = process.platform;
+    const home = process.env.HOME || process.env.USERPROFILE || '';
+
+    switch (platform) {
+      case 'linux':
+        return join(home, '.local/share/godot/app_userdata', projectName);
+      case 'darwin':
+        return join(home, 'Library/Application Support/Godot/app_userdata', projectName);
+      case 'win32':
+        return join(process.env.APPDATA || '', 'Godot/app_userdata', projectName);
+      default:
+        throw new Error(`Unsupported platform: ${platform}`);
+    }
+  }
+
+  /**
+   * Sleep helper for async polling
+   * @param ms Milliseconds to sleep
+   */
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   /**
@@ -1375,6 +1508,43 @@ class GodotServer {
             required: ['projectPath', 'scriptPath'],
           },
         },
+        // Screenshot capture tool
+        {
+          name: 'capture_screenshot',
+          description: 'Capture a screenshot from the running game viewport. Returns base64-encoded image. Requires game to be running via run_project first.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              source: {
+                type: 'string',
+                enum: ['game'],
+                default: 'game',
+                description: 'Viewport to capture (currently only "game" is supported)',
+              },
+              maxDimension: {
+                type: 'number',
+                default: 1920,
+                description: 'Maximum width or height in pixels (100-4096). Image will be scaled down if larger, maintaining aspect ratio.',
+              },
+              format: {
+                type: 'string',
+                enum: ['png', 'jpg'],
+                default: 'png',
+                description: 'Image format for the screenshot',
+              },
+              quality: {
+                type: 'number',
+                default: 85,
+                description: 'JPEG quality (1-100). Only used when format is "jpg".',
+              },
+            },
+            required: ['projectPath'],
+          },
+        },
       ],
     }));
 
@@ -1432,6 +1602,9 @@ class GodotServer {
         // Validation tools
         case 'validate_script':
           return await this.handleValidateScript(request.params.arguments);
+        // Screenshot capture
+        case 'capture_screenshot':
+          return await this.handleCaptureScreenshot(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -1561,6 +1734,9 @@ class GodotServer {
         this.activeProcess.process.kill();
       }
 
+      // Inject screenshot capture AutoLoad before running
+      this.injectScreenshotAutoload(args.projectPath);
+
       const cmdArgs = ['-d', '--path', args.projectPath];
       if (args.scene && this.validatePath(args.scene)) {
         this.logDebug(`Adding scene parameter: ${args.scene}`);
@@ -1621,6 +1797,8 @@ class GodotServer {
 
       process.on('exit', (code: number | null) => {
         this.logDebug(`Godot process exited with code ${code}`);
+        // Clean up injected screenshot autoload
+        this.removeScreenshotAutoload();
         if (this.activeProcess && this.activeProcess.process === process) {
           this.activeProcess = null;
         }
@@ -1821,6 +1999,9 @@ class GodotServer {
     const output = this.activeProcess.output;
     const errors = this.activeProcess.errors;
     this.activeProcess = null;
+
+    // Clean up injected screenshot autoload (in case exit handler didn't fire)
+    this.removeScreenshotAutoload();
 
     return {
       content: [
@@ -4114,6 +4295,189 @@ class GodotServer {
       seen.add(key);
       return true;
     });
+  }
+
+  /**
+   * Handle the capture_screenshot tool
+   * Captures a screenshot from the running game viewport
+   */
+  private async handleCaptureScreenshot(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args);
+
+    if (!args.projectPath) {
+      return this.createErrorResponse(
+        'Project path is required',
+        ['Provide a valid path to a Godot project directory']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse(
+        'Invalid project path',
+        ['Provide a valid path without ".." or other potentially unsafe characters']
+      );
+    }
+
+    // Validate game is running
+    const source = args.source || 'game';
+    if (source === 'game' && !this.activeProcess) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            source,
+            error: 'Game is not running. Start the game first with run_project.',
+          }, null, 2),
+        }],
+      };
+    }
+
+    // Get parameters with defaults
+    const maxDimension = Math.max(100, Math.min(4096, args.maxDimension || 1920));
+    const format = args.format === 'jpg' ? 'jpg' : 'png';
+    const quality = Math.max(1, Math.min(100, args.quality || 85));
+
+    try {
+      // Get the user data path for the project
+      const userDataPath = this.getUserDataPath(args.projectPath);
+
+      // Ensure user data directory exists
+      if (!existsSync(userDataPath)) {
+        mkdirSync(userDataPath, { recursive: true });
+      }
+
+      // Define file paths
+      const requestFile = join(userDataPath, 'mcp_capture_request.txt');
+      const outputFile = join(userDataPath, `mcp_screenshot.${format}`);
+      const metaFile = join(userDataPath, 'mcp_screenshot_meta.json');
+
+      // Clean up any stale files
+      for (const f of [requestFile, outputFile, metaFile]) {
+        if (existsSync(f)) {
+          unlinkSync(f);
+        }
+      }
+
+      // Write capture request
+      const request = JSON.stringify({
+        max_dimension: maxDimension,
+        format,
+        quality,
+      });
+      writeFileSync(requestFile, request);
+      this.logDebug(`Wrote capture request to ${requestFile}`);
+
+      // Poll for capture completion
+      const timeout = 5000; // 5 seconds
+      const pollInterval = 100; // 100ms
+      const startTime = Date.now();
+
+      while (Date.now() - startTime < timeout) {
+        if (existsSync(metaFile)) {
+          // Read metadata
+          const metaContent = readFileSync(metaFile, 'utf-8');
+          let meta;
+          try {
+            meta = JSON.parse(metaContent);
+          } catch {
+            // Metadata file might still be being written
+            await this.sleep(pollInterval);
+            continue;
+          }
+
+          // Clean up meta file
+          try {
+            unlinkSync(metaFile);
+          } catch {
+            // Ignore cleanup errors
+          }
+
+          // Check for error
+          if (!meta.success) {
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  success: false,
+                  source,
+                  error: meta.error || 'Unknown capture error',
+                }, null, 2),
+              }],
+            };
+          }
+
+          // Read the screenshot
+          if (!existsSync(outputFile)) {
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  success: false,
+                  source,
+                  error: 'Screenshot file not found after capture',
+                }, null, 2),
+              }],
+            };
+          }
+
+          const imageBuffer = readFileSync(outputFile);
+          const imageBase64 = imageBuffer.toString('base64');
+
+          // Clean up output file
+          try {
+            unlinkSync(outputFile);
+          } catch {
+            // Ignore cleanup errors
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                success: true,
+                image_base64: imageBase64,
+                format: meta.format,
+                width: meta.width,
+                height: meta.height,
+                source,
+              }, null, 2),
+            }],
+          };
+        }
+
+        await this.sleep(pollInterval);
+      }
+
+      // Timeout - clean up request file if still there
+      if (existsSync(requestFile)) {
+        try {
+          unlinkSync(requestFile);
+        } catch {
+          // Ignore cleanup errors
+        }
+      }
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            source,
+            error: 'Screenshot capture timed out. Is the MCP screenshot AutoLoad active in the running game?',
+          }, null, 2),
+        }],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Screenshot capture failed: ${error?.message || 'Unknown error'}`,
+        [
+          'Ensure the game is running via run_project',
+          'Check that the project path is correct',
+        ]
+      );
+    }
   }
 
   /**
