@@ -84,7 +84,21 @@ interface GodotProcess {
   errors: string[];
   runtimeErrors: RuntimeErrorBuffer;
   pendingErrorLine: string | null;
+  debugMessages: DebugMessage[];
 }
+
+/**
+ * Interface for unified debug messages (print, warning, error)
+ */
+interface DebugMessage {
+  timestamp: number;
+  category: 'print' | 'warning' | 'error';
+  message: string;
+  source: string; // "stdout" for print, "res://path:line" for errors/warnings
+}
+
+// Maximum number of debug messages to keep in buffer (FIFO)
+const MAX_DEBUG_MESSAGES = 500;
 
 /**
  * Interface for server configuration
@@ -363,6 +377,60 @@ class GodotServer {
     }
 
     return null;
+  }
+
+  /**
+   * Parse a stderr line into a structured DebugMessage
+   * Categorizes as warning, error, or defaults to error for stderr content
+   * @param line The stderr line to parse
+   * @returns A DebugMessage object with timestamp, category, message, and source
+   */
+  private parseStderrLine(line: string): DebugMessage {
+    const timestamp = Date.now() / 1000;
+    const trimmedLine = line.trim();
+
+    // Check for WARNING pattern
+    if (trimmedLine.includes('WARNING:') || trimmedLine.toUpperCase().includes('WARNING')) {
+      const sourceMatch = trimmedLine.match(/(res:\/\/[^:\s]+):(\d+)/);
+      return {
+        timestamp,
+        category: 'warning',
+        message: trimmedLine.replace(/^WARNING:\s*/i, '').trim(),
+        source: sourceMatch ? `${sourceMatch[1]}:${sourceMatch[2]}` : 'stderr',
+      };
+    }
+
+    // Check for ERROR pattern
+    if (trimmedLine.includes('ERROR:') || trimmedLine.includes('SCRIPT ERROR:') || trimmedLine.toUpperCase().includes('ERROR')) {
+      const sourceMatch = trimmedLine.match(/(res:\/\/[^:\s]+):(\d+)/);
+      return {
+        timestamp,
+        category: 'error',
+        message: trimmedLine.replace(/^(SCRIPT )?ERROR:\s*/i, '').trim(),
+        source: sourceMatch ? `${sourceMatch[1]}:${sourceMatch[2]}` : 'stderr',
+      };
+    }
+
+    // Check for script path pattern (res://path:line - message)
+    const scriptMatch = trimmedLine.match(/^(res:\/\/[^:]+):(\d+)\s*[-:]\s*(.+)$/);
+    if (scriptMatch) {
+      const msgContent = scriptMatch[3];
+      const category = msgContent.toUpperCase().includes('WARNING') ? 'warning' : 'error';
+      return {
+        timestamp,
+        category,
+        message: msgContent,
+        source: `${scriptMatch[1]}:${scriptMatch[2]}`,
+      };
+    }
+
+    // Default: treat as error (stderr is usually errors)
+    return {
+      timestamp,
+      category: 'error',
+      message: trimmedLine,
+      source: 'stderr',
+    };
   }
 
   /**
@@ -865,10 +933,28 @@ class GodotServer {
         },
         {
           name: 'get_debug_output',
-          description: 'Get the current debug output and errors',
+          description: 'Get debug output from running Godot project with filtering options',
           inputSchema: {
             type: 'object',
-            properties: {},
+            properties: {
+              since_timestamp: {
+                type: 'number',
+                description: 'Only return messages after this Unix timestamp',
+              },
+              category: {
+                type: 'string',
+                enum: ['all', 'print', 'warning', 'error'],
+                description: 'Filter by message category (default: "all")',
+              },
+              limit: {
+                type: 'number',
+                description: 'Maximum number of messages to return (default: 100, max: 1000)',
+              },
+              clear_after_read: {
+                type: 'boolean',
+                description: 'Clear the message buffer after reading (default: false)',
+              },
+            },
             required: [],
           },
         },
@@ -1301,7 +1387,7 @@ class GodotServer {
         case 'run_project':
           return await this.handleRunProject(request.params.arguments);
         case 'get_debug_output':
-          return await this.handleGetDebugOutput();
+          return await this.handleGetDebugOutput(request.params.arguments);
         case 'get_runtime_errors':
           return await this.handleGetRuntimeErrors(request.params.arguments);
         case 'stop_project':
@@ -1485,6 +1571,7 @@ class GodotServer {
       const process = spawn(this.godotPath!, cmdArgs, { stdio: 'pipe' });
       const output: string[] = [];
       const errors: string[] = [];
+      const debugMessages: DebugMessage[] = [];
       const runtimeErrors: RuntimeErrorBuffer = {
         errors: [],
         maxSize: MAX_RUNTIME_ERRORS,
@@ -1495,7 +1582,21 @@ class GodotServer {
         const lines = data.toString().split('\n');
         output.push(...lines);
         lines.forEach((line: string) => {
-          if (line.trim()) this.logDebug(`[Godot stdout] ${line}`);
+          const trimmedLine = line.trim();
+          if (trimmedLine) {
+            this.logDebug(`[Godot stdout] ${line}`);
+            // Add to unified debug message buffer
+            debugMessages.push({
+              timestamp: Date.now() / 1000,
+              category: 'print',
+              message: trimmedLine,
+              source: 'stdout',
+            });
+            // FIFO: drop oldest if over limit
+            if (debugMessages.length > MAX_DEBUG_MESSAGES) {
+              debugMessages.shift();
+            }
+          }
         });
       });
 
@@ -1505,8 +1606,15 @@ class GodotServer {
         lines.forEach((line: string) => {
           if (line.trim()) {
             this.logDebug(`[Godot stderr] ${line}`);
-            // Parse errors in real-time and update pending line state
+            // Parse errors in real-time for runtimeErrors buffer
             pendingErrorLine = this.parseAndStoreError(line, runtimeErrors, pendingErrorLine);
+            // Add to unified debug message buffer
+            const debugMsg = this.parseStderrLine(line);
+            debugMessages.push(debugMsg);
+            // FIFO: drop oldest if over limit
+            if (debugMessages.length > MAX_DEBUG_MESSAGES) {
+              debugMessages.shift();
+            }
           }
         });
       });
@@ -1525,7 +1633,7 @@ class GodotServer {
         }
       });
 
-      this.activeProcess = { process, output, errors, runtimeErrors, pendingErrorLine };
+      this.activeProcess = { process, output, errors, runtimeErrors, pendingErrorLine, debugMessages };
 
       return {
         content: [
@@ -1550,8 +1658,12 @@ class GodotServer {
 
   /**
    * Handle the get_debug_output tool
+   * Returns structured debug messages with filtering options
    */
-  private async handleGetDebugOutput() {
+  private async handleGetDebugOutput(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args);
+
     if (!this.activeProcess) {
       return this.createErrorResponse(
         'No active Godot process.',
@@ -1562,14 +1674,55 @@ class GodotServer {
       );
     }
 
+    const {
+      sinceTimestamp,
+      category = 'all',
+      limit = 100,
+      clearAfterRead = false,
+    } = args;
+
+    // Start with all messages
+    let filtered = [...this.activeProcess.debugMessages];
+
+    // Filter by timestamp
+    if (sinceTimestamp !== undefined) {
+      const ts = parseFloat(sinceTimestamp);
+      if (!isNaN(ts)) {
+        filtered = filtered.filter(msg => msg.timestamp > ts);
+      }
+    }
+
+    // Filter by category
+    if (category !== 'all') {
+      filtered = filtered.filter(msg => msg.category === category);
+    }
+
+    // Calculate metadata before limiting
+    const totalBuffered = this.activeProcess.debugMessages.length;
+    const oldestTimestamp = this.activeProcess.debugMessages.length > 0
+      ? this.activeProcess.debugMessages[0].timestamp
+      : null;
+
+    // Apply limit (clamp between 1 and 1000, take most recent)
+    const effectiveLimit = Math.min(Math.max(limit, 1), 1000);
+    if (filtered.length > effectiveLimit) {
+      filtered = filtered.slice(-effectiveLimit);
+    }
+
+    // Clear buffer if requested
+    if (clearAfterRead === true) {
+      this.activeProcess.debugMessages = [];
+    }
+
     return {
       content: [
         {
           type: 'text',
           text: JSON.stringify(
             {
-              output: this.activeProcess.output,
-              errors: this.activeProcess.errors,
+              messages: filtered,
+              total_buffered: totalBuffered,
+              oldest_timestamp: oldestTimestamp,
             },
             null,
             2
