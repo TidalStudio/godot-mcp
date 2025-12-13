@@ -5,7 +5,10 @@
       "Bash(npm install)",
       "Bash(claude mcp list:*)",
       "Bash(npm run build:*)",
-      "Bash(node:*)"
+      "Bash(node:*)",
+      "Bash(git -C /c/Users/logan/Documents/GitHub/godot-mcp log --oneline -10)",
+      "Bash(git -C /c/Users/logan/Documents/GitHub/godot-mcp show 43f5490 --stat)",
+      "Bash(cat:*)"
     ]
   }
 }

@@ -1204,6 +1204,31 @@ class GodotServer {
             required: [],
           },
         },
+        {
+          name: 'get_signal_connections',
+          description: 'Get all signal connections for a node in the currently edited scene. Shows which signals are connected to which methods. Requires Godot editor with MCP Bridge plugin enabled.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              nodePath: {
+                type: 'string',
+                description: 'Path to node relative to scene root (e.g., "Player", "Player/Sprite2D"). Empty or "." for root node.',
+                default: '.',
+              },
+              recursive: {
+                type: 'boolean',
+                description: 'Include connections from child nodes (default: true)',
+                default: true,
+              },
+              includeInternal: {
+                type: 'boolean',
+                description: 'Include internal editor/engine connections (default: false). Set to true to see all connections including Godot internals.',
+                default: false,
+              },
+            },
+            required: [],
+          },
+        },
       ],
     }));
 
@@ -1254,6 +1279,8 @@ class GodotServer {
           return await this.handleGetLocalVariables(request.params.arguments);
         case 'get_signals':
           return await this.handleGetSignals(request.params.arguments);
+        case 'get_signal_connections':
+          return await this.handleGetSignalConnections(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -3065,6 +3092,89 @@ class GodotServer {
     } catch (error: any) {
       return this.createErrorResponse(
         `Failed to get signals: ${error?.message || 'Unknown error'}`,
+        [
+          'Ensure Godot editor is still running',
+          'Use connect_debugger to reconnect',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the get_signal_connections tool
+   * Gets all signal connections for a node in the edited scene via MCP Bridge
+   */
+  private async handleGetSignalConnections(args: any) {
+    args = this.normalizeParameters(args);
+
+    // Check if we have a bridge connection
+    if (!this.bridgePort) {
+      return this.createErrorResponse(
+        'Not connected to editor',
+        [
+          'Use connect_debugger first to establish connection to the Godot editor',
+          'Ensure the MCP Bridge plugin is enabled in the editor',
+        ]
+      );
+    }
+
+    try {
+      // Verify bridge is still reachable
+      const bridgeReachable = await checkPort(this.bridgeHost, this.bridgePort);
+      if (!bridgeReachable) {
+        return this.createErrorResponse(
+          'Lost connection to MCP Bridge plugin',
+          [
+            'Check if the Godot editor is still running',
+            'Use connect_debugger to reconnect',
+          ]
+        );
+      }
+
+      const nodePath = args.nodePath || '.';
+      const recursive = args.recursive ?? true;
+      const includeInternal = args.includeInternal ?? false;
+
+      const response = await this.sendBridgeCommand(`get_signal_connections:${nodePath}:${recursive}:${includeInternal}`);
+
+      if (response.startsWith('ERROR:NO_SCENE_OPEN')) {
+        return this.createErrorResponse(
+          'No scene is currently open in the editor',
+          ['Open a scene in the Godot editor first']
+        );
+      }
+
+      if (response.startsWith('ERROR:NODE_NOT_FOUND:')) {
+        const path = response.split(':')[2];
+        return this.createErrorResponse(
+          `Node not found: ${path}`,
+          [
+            'Check that the node path is correct',
+            'Node path should be relative to the scene root',
+            'Use "." or empty string for the root node',
+          ]
+        );
+      }
+
+      if (response.startsWith('CONNECTIONS:')) {
+        const jsonStr = response.substring(12);
+        const connectionsData = JSON.parse(jsonStr);
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(connectionsData, null, 2),
+          }],
+        };
+      }
+
+      return this.createErrorResponse(
+        `Unexpected response from bridge: ${response}`,
+        ['Check the Godot editor for errors']
+      );
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to get signal connections: ${error?.message || 'Unknown error'}`,
         [
           'Ensure Godot editor is still running',
           'Use connect_debugger to reconnect',
